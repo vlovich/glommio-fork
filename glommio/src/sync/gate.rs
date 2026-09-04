@@ -24,6 +24,42 @@ pub struct Pass {
     gate: Rc<GateInner>,
 }
 
+impl Pass {
+    /// A new pass is attempted to be retrieved from the same gate as this pass, honoring
+    /// the request on the gate to close. This is a convenience method for
+    /// `self.gate().enter()` (see [`Self::gate`]).
+    ///
+    /// # Errors
+    ///
+    /// If the gate was requested to close, this returns an error. If you want to
+    /// clone unconditionally and forcefully delay closure, use [`Self::clone_ignoring_gate_closure`].
+    pub fn try_clone(&self) -> Result<Self, GlommioError<()>> {
+        self.gate.enter().map(|()| Self {
+            gate: self.gate.clone(),
+        })
+    }
+
+    /// Returns a clone of the gate that this pass represents.
+    pub fn gate(&self) -> Gate {
+        Gate {
+            inner: self.gate.clone(),
+        }
+    }
+
+    /// Unlike [`Self::try_clone`], this will forcibly cause a new pass to be created
+    /// even if a closure was requested. This isn't explicitly [Clone] to avoid accidentally
+    /// cloning a pass without realizing that it prolongs the lifetime of the gate while
+    /// ignoring any ongoing closure attempt. If you want to honor the gate closure,
+    /// then use [`Self::try_clone`].
+    pub fn clone_ignoring_gate_closure(&self) -> Self {
+        let cloned = Self {
+            gate: self.gate.clone(),
+        };
+        cloned.gate.force_increment();
+        cloned
+    }
+}
+
 impl Drop for Pass {
     fn drop(&mut self) {
         self.gate.leave()
@@ -126,6 +162,10 @@ impl GateInner {
         open
     }
 
+    fn force_increment(&self) {
+        self.count.set(self.count.get() + 1);
+    }
+
     pub fn enter(&self) -> Result<(), GlommioError<()>> {
         if !self.try_enter() {
             Err(GlommioError::Closed(ResourceType::Gate))
@@ -209,8 +249,11 @@ impl GateInner {
 mod tests {
     use super::*;
     use crate::sync::Semaphore;
+    use crate::task::waker_fn::dummy_waker;
     use crate::{enclose, timer::timeout, LocalExecutor};
     use futures::{join, FutureExt};
+    use futures_lite::pin;
+    use std::task::Context;
     use std::time::Duration;
 
     #[test]
@@ -411,5 +454,45 @@ mod tests {
             std::mem::drop(pass);
             close1.await.expect("Closure signal should still arrive");
         })
+    }
+
+    #[test]
+    fn pass_is_cloneable_if_ignoring_pending_closure() {
+        LocalExecutor::default().run(async {
+            let gate = Gate::new();
+            let pass1 = gate.enter().unwrap();
+            let pass2 = pass1.try_clone().unwrap();
+            assert_eq!(2, gate.inner.count.get());
+
+            let closure = gate.close();
+            pin!(closure);
+
+            assert!(pass2.try_clone().is_err());
+            assert_eq!(2, gate.inner.count.get());
+            let pass3 = pass2.clone_ignoring_gate_closure();
+            assert_eq!(3, gate.inner.count.get());
+            drop(pass3);
+
+            let dummy_waker = dummy_waker();
+            let cx = &mut Context::from_waker(&dummy_waker);
+            assert!(closure.as_mut().poll(cx).is_pending());
+            assert!(!gate.is_open());
+            assert!(pass1.try_clone().is_err());
+            assert!(pass2.try_clone().is_err());
+
+            assert_eq!(2, gate.inner.count.get());
+
+            drop(pass1);
+
+            assert_eq!(1, gate.inner.count.get());
+            assert!(!gate.is_closed());
+            assert!(closure.as_mut().poll(cx).is_pending());
+
+            drop(pass2);
+
+            assert_eq!(0, gate.inner.count.get());
+            assert!(gate.is_closed());
+            assert!(closure.as_mut().poll(cx).is_ready());
+        });
     }
 }
