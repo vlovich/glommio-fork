@@ -39,7 +39,7 @@ use crate::{
     reactor,
     sys::{self, blocking::BlockingThreadPool},
     task::{self, registry::TaskRegistry, waker_fn::dummy_waker},
-    GlommioError, IoRequirements, IoStats, Latency, Shares,
+    BeforeParkHandle, GlommioError, IoRequirements, IoStats, Latency, Shares,
 };
 use ahash::AHashMap;
 use futures_lite::pin;
@@ -1484,6 +1484,39 @@ impl LocalExecutor {
         true
     }
 
+    /// Runs one complete idle batch in the default queue, monitoring stalls and
+    /// accounting for callbacks and their deferred destructors even on unwind.
+    fn run_idle_callbacks(&self) {
+        self.context.with_cleanup(None, || {
+            let queue = self
+                .context
+                .queues
+                .borrow()
+                .active_executing
+                .clone()
+                .expect("idle callbacks require a task queue");
+            let time = Instant::now();
+            defer! {
+                let runtime = time.elapsed();
+                queue.borrow_mut().stats.runtime += runtime;
+                let mut queues = self.context.queues.borrow_mut();
+                queues.stats.executor_runtime += runtime;
+                queues.stats.total_runtime += runtime;
+            }
+            let detector = self.stall_detector.borrow();
+            let _guard = detector.as_ref().and_then(|detector| {
+                let queue = queue.borrow();
+                detector.enter_task_queue(
+                    queue.stats.index,
+                    queue.name.clone(),
+                    time,
+                    self.preempt_timer_duration(),
+                )
+            });
+            self.context.reactor.idle_workers.run();
+        });
+    }
+
     /// Runs the executor until the given future completes.
     ///
     /// # Examples
@@ -1536,27 +1569,31 @@ impl LocalExecutor {
                 let cur_time = Instant::now();
                 this.context.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
                 pre_time = cur_time;
-                if queues == TaskQueueRun::Idle {
-                    if let Poll::Ready(t) = future.as_mut().poll(cx) {
-                        break t.unwrap();
-                    } else {
-                        while !this.context.reactor.spin_poll_io().unwrap() {
-                            if pre_time.elapsed() > spin_before_park {
-                                debug_assert!(
-                                    this.context.queues.borrow().active_executors.is_empty(),
-                                    "parking with {} runnable task queues: nothing will wake us",
-                                    this.context.queues.borrow().active_executors.len()
-                                );
-                                this.context
-                                    .reactor
-                                    .react(|| None)
-                                    .expect("Failed to park! This is actually pretty bad!");
-                                break;
-                            }
+                if queues != TaskQueueRun::Idle {
+                    continue;
+                }
+                if let Poll::Ready(t) = future.as_mut().poll(cx) {
+                    break t.unwrap();
+                }
+
+                this.run_idle_callbacks();
+                if this.context.queues.borrow().active_executors.is_empty() {
+                    while !this.context.reactor.spin_poll_io().unwrap() {
+                        if pre_time.elapsed() > spin_before_park {
+                            debug_assert!(
+                                this.context.queues.borrow().active_executors.is_empty(),
+                                "parking with {} runnable task queues: nothing will wake us",
+                                this.context.queues.borrow().active_executors.len()
+                            );
+                            this.context
+                                .reactor
+                                .react(|| None)
+                                .expect("Failed to park! This is actually pretty bad!");
+                            break;
                         }
-                        pre_time = Instant::now();
                     }
                 }
+                pre_time = Instant::now();
             }
         };
 
@@ -1575,6 +1612,7 @@ impl Drop for LocalExecutor {
                 .expect("executor's sleep notifier disappeared before shutdown")
                 .close_foreign_wakes();
             self.context.tasks.request_shutdown();
+            self.context.reactor.idle_workers.shutdown();
         };
 
         self.context.with_cleanup(None, shutdown);
@@ -2129,6 +2167,97 @@ pub unsafe fn spawn_scoped_local_into<'a, T>(
 pub struct ExecutorProxy {}
 
 impl ExecutorProxy {
+    /// Registers a synchronous callback to run before the reactor attempts to park.
+    /// Callbacks run in an unspecified order. The callbacks run in the default queue
+    /// so keep that in mind when spawning tasks (use [`crate::spawn_local_into`] if
+    /// you want to pick the queue). Callbacks run when there's no more work before
+    /// any spinning [`LocalExecutorBuilder::spin_before_park`] may have configured.
+    ///
+    /// Callbacks may spawn futures which will prevent the reactor from going idle.
+    /// However, all the callbacks that were present at the start of the park attempt
+    /// are invoked. Adding/removing callbacks won't take effect until the next time
+    /// the reactor goes to try to sleep and any spawned tasks within the callback
+    /// will only execute once all registered callbacks have been invoked.
+    ///
+    /// Dropping the returned handle unregisters the callback. Callbacks are
+    /// also released when the executor is dropped, even if their handles
+    /// survive. A callback panic unwinds out of [`LocalExecutor::run`].
+    ///
+    /// # Caution
+    ///
+    /// Giving the executor work unconditionally from the idle callback
+    /// (e.g. spawning a task) will result in an infinite spinning of the reactor even
+    /// if that task would immediately block. As soon as the task yields we'll still
+    /// invoke the registered callback again resulting in that work getting scheduled.
+    /// This callback isn't really intended for spawning tasks but they're supported in
+    /// case you have some async work. For example, you're implementing the idea behind
+    /// Nagle's algorithm and want to make sure any asynchronous writes to a file or
+    /// network are sent out as a single write call. You'd consume that list in
+    /// spawning a task to do the I/O, leaving an empty list behind. That way the
+    /// subsequent idle callback when the write blocks will encounter an empty list and
+    /// no I/O to spawn schedule.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no executor running on this thread.
+    ///
+    /// # Errors
+    ///
+    /// If an attempt is made to register more callbacks than is supported.
+    ///
+    /// # Examples
+    ///
+    /// Accumulate pending buffers, then send them together from a single async
+    /// task when the executor becomes idle. Draining the list before spawning
+    /// prevents the next idle callback from resubmitting the same work.
+    ///
+    /// ```
+    /// use glommio::{executor, net::UnixDatagram, spawn_local, LocalExecutor};
+    /// use std::{cell::RefCell, rc::Rc};
+    ///
+    /// LocalExecutor::default().run(async {
+    ///     let (sender, receiver) = UnixDatagram::pair().unwrap();
+    ///     let sender = Rc::new(sender);
+    ///     let pending = Rc::new(RefCell::new(Vec::<Vec<u8>>::new()));
+    ///     let worker = executor().register_before_park({
+    ///         let pending = pending.clone();
+    ///         move || {
+    ///             let batch = std::mem::take(&mut *pending.borrow_mut());
+    ///             if !batch.is_empty() {
+    ///                 let sender = sender.clone();
+    ///                 spawn_local(async move {
+    ///                     let bytes = batch.concat();
+    ///                     sender.send(&bytes).await.unwrap();
+    ///                 }).detach();
+    ///             }
+    ///         }
+    ///     }).unwrap();
+    ///
+    ///     pending.borrow_mut().push(b"hello ".to_vec());
+    ///     pending.borrow_mut().push(b"world".to_vec());
+    ///
+    ///     let mut bytes = [0; 64];
+    ///     let received = receiver.recv(&mut bytes).await.unwrap();
+    ///     assert_eq!(&bytes[..received], b"hello world");
+    ///     assert!(pending.borrow().is_empty());
+    ///     drop(worker);
+    /// });
+    /// ```
+    pub fn register_before_park(
+        &self,
+        callback: impl FnMut() + 'static,
+    ) -> Result<BeforeParkHandle> {
+        with_executor_context(|context| {
+            let context = context.expect("this thread doesn't have a LocalExecutor running");
+            context
+                .reactor
+                .idle_workers
+                .register(callback)
+                .map(|registration| BeforeParkHandle::new(registration, &context.tasks))
+                .map_err(|error| GlommioError::IoError(std::io::Error::other(error)))
+        })
+    }
+
     /// Checks if this task has run for too long and need to be preempted. This
     /// is useful for situations where we can't call .await, for instance,
     /// if a [`RefMut`] is held. If this tests true, then the user is

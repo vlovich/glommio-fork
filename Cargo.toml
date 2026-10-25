@@ -1,5 +1,11 @@
 [workspace]
-members  = ["examples", "glommio", "glommio-dense-registry", "glommio-macros"]
+members  = [
+  "examples",
+  "glommio",
+  "glommio-dense-registry",
+  "glommio-idle",
+  "glommio-macros",
+]
 resolver = "2"
 
 [workspace.package]
@@ -8,6 +14,8 @@ version = "0.11.0"
 rust-version = "1.92"
 
 [workspace.dependencies]
+glommio-dense-registry = { path = "glommio-dense-registry", version = "0.11.0" }
+glommio-idle = { path = "glommio-idle", version = "0.11.0" }
 glommio-macros = { path = "glommio-macros", version = "0.11.0" }
 
 [workspace.metadata.dylint]

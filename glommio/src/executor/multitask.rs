@@ -165,17 +165,6 @@ impl Scheduler {
         )
     }
 
-    pub(crate) fn spawn_and_run<T>(
-        self: Rc<Self>,
-        registry: &TaskRegistry,
-        tq: Rc<RefCell<TaskQueue>>,
-        future: impl Future<Output = T>,
-    ) -> Task<T> {
-        let (runnable, handle) = self.spawn(registry, tq, future);
-        runnable.run();
-        Task(Some(handle))
-    }
-
     pub(crate) fn spawn_and_schedule<T>(
         self: Rc<Self>,
         registry: &TaskRegistry,
@@ -184,6 +173,23 @@ impl Scheduler {
     ) -> Task<T> {
         let (runnable, handle) = self.spawn(registry, tq, future);
         runnable.schedule();
+        Task(Some(handle))
+    }
+
+    /// Allocates the future before dispatching its runnable, avoiding copies of
+    /// large captures into dispatch arguments. The callback invokes one action.
+    #[inline(always)]
+    pub(crate) fn spawn_dispatch<T>(
+        self: Rc<Self>,
+        schedule_or_run: impl FnOnce(Runnable, fn(Runnable), fn(Runnable)),
+        registry: &TaskRegistry,
+        tq: Rc<RefCell<TaskQueue>>,
+        future: impl Future<Output = T>,
+    ) -> Task<T> {
+        let (runnable, handle) = self.spawn(registry, tq, future);
+        schedule_or_run(runnable, Runnable::schedule, |runnable| {
+            runnable.run();
+        });
         Task(Some(handle))
     }
 }
